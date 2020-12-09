@@ -236,7 +236,6 @@ func (woc *wfOperationCtx) createWorkflowPod(nodeName string, mainCtr apiv1.Cont
 	}
 
 	addSchedulingConstraints(pod, wfSpec, tmpl)
-	woc.addMetadata(pod, tmpl, opts)
 
 	err = addVolumeReferences(pod, woc.volumes, tmpl, woc.wf.Status.PersistentVolumeClaims)
 	if err != nil {
@@ -350,6 +349,7 @@ func (woc *wfOperationCtx) createWorkflowPod(nodeName string, mainCtr apiv1.Cont
 		woc.log.Debugf("Setting new activeDeadlineSeconds %d for pod %s/%s due to templateDeadline", newActiveDeadlineSeconds, pod.Namespace, pod.Name)
 		pod.Spec.ActiveDeadlineSeconds = &newActiveDeadlineSeconds
 	}
+	woc.addMetadata(pod, tmpl, opts)
 
 	// we must check to see if the pod exists rather than just optimistically creating the pod and see if we get
 	// an `AlreadyExists` error because we won't get that error if there is not enough resources
@@ -625,6 +625,16 @@ func (woc *wfOperationCtx) addMetadata(pod *apiv1.Pod, tmpl *wfv1.Template, opts
 		execCtl.Deadline = &opts.executionDeadline
 	}
 
+	// https://github.com/argoproj/argo/issues/1093
+	// replace ActiveDeadlineSeconds with execCtl
+	podDeadline := getPodDeadline(pod)
+	if podDeadline != nil {
+		if !podDeadline.IsZero() && (execCtl.Deadline == nil || podDeadline.Before(*execCtl.Deadline)) {
+			execCtl.Deadline = podDeadline
+		}
+		pod.Spec.ActiveDeadlineSeconds = nil
+	}
+
 	if execCtl.Deadline != nil || opts.includeScriptOutput {
 		execCtlBytes, err := json.Marshal(execCtl)
 		if err != nil {
@@ -633,6 +643,21 @@ func (woc *wfOperationCtx) addMetadata(pod *apiv1.Pod, tmpl *wfv1.Template, opts
 
 		pod.ObjectMeta.Annotations[common.AnnotationKeyExecutionControl] = string(execCtlBytes)
 	}
+}
+
+func getPodDeadline(pod *apiv1.Pod) *time.Time {
+	if pod.Spec.ActiveDeadlineSeconds == nil {
+		return nil
+	}
+
+	var startedAt time.Time
+	if pod.Status.StartTime.IsZero() {
+		startedAt = time.Now()
+	} else {
+		startedAt = pod.Status.StartTime.Truncate(time.Second)
+	}
+	deadline := startedAt.Add(time.Duration(*pod.Spec.ActiveDeadlineSeconds) * time.Second).UTC()
+	return &deadline
 }
 
 // addSchedulingConstraints applies any node selectors or affinity rules to the pod, either set in the workflow or the template
